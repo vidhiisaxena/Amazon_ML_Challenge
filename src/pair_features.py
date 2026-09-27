@@ -11,7 +11,13 @@ Usage:
     feats.to_csv("dataset/cleaned/pair_features.tsv", sep="\t", index=False)
 """
 
-from difflib import SequenceMatcher
+try:
+    from rapidfuzz.distance import Levenshtein as rf_lev
+    from rapidfuzz import fuzz as rf_fuzz
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
+    from difflib import SequenceMatcher
 
 import pandas as pd
 
@@ -41,7 +47,15 @@ def _seq_ratio(a: str, b: str) -> float:
         return 1.0
     if not a or not b:
         return 0.0
+    if _HAS_RAPIDFUZZ:
+        return float(rf_lev.normalized_similarity(a, b))
     return SequenceMatcher(None, a, b).ratio()
+
+
+def _token_sort_ratio(name1: str, name2: str, sorted_name1: str, sorted_name2: str) -> float:
+    if _HAS_RAPIDFUZZ:
+        return float(rf_fuzz.token_sort_ratio(name1, name2)) / 100.0
+    return _seq_ratio(sorted_name1, sorted_name2)
 
 
 def _common_prefix_ratio(a: str, b: str) -> float:
@@ -55,10 +69,16 @@ def _common_prefix_ratio(a: str, b: str) -> float:
     return n / max(len(a), len(b))
 
 
+
 def pair_feature_dict(name1: str, name2: str, addr1: str, addr2: str,
                        country1: str, country2: str) -> dict:
-    name1, name2 = name1 or '', name2 or ''
-    addr1, addr2 = addr1 or '', addr2 or ''
+    name1 = '' if (name1 is None or pd.isna(name1)) else str(name1)
+    name2 = '' if (name2 is None or pd.isna(name2)) else str(name2)
+    addr1 = '' if (addr1 is None or pd.isna(addr1)) else str(addr1)
+    addr2 = '' if (addr2 is None or pd.isna(addr2)) else str(addr2)
+    country1 = '' if (country1 is None or pd.isna(country1)) else str(country1)
+    country2 = '' if (country2 is None or pd.isna(country2)) else str(country2)
+
 
     name_tokens1, name_tokens2 = set(_tokens(name1)), set(_tokens(name2))
     addr_tokens1, addr_tokens2 = set(_tokens(addr1)), set(_tokens(addr2))
@@ -76,7 +96,7 @@ def pair_feature_dict(name1: str, name2: str, addr1: str, addr2: str,
         'name_jaccard_char3gram': _jaccard(name_ng1, name_ng2),
         'name_containment': _containment(name_tokens1, name_tokens2),
         'name_levenshtein_ratio': _seq_ratio(name1, name2),
-        'name_token_sort_ratio': _seq_ratio(sorted_name1, sorted_name2),
+        'name_token_sort_ratio': _token_sort_ratio(name1, name2, sorted_name1, sorted_name2),
         'name_common_prefix_ratio': _common_prefix_ratio(name1, name2),
         'name_length_diff': abs(len(name_tokens1) - len(name_tokens2)),
 

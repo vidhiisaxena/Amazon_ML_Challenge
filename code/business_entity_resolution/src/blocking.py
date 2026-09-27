@@ -52,10 +52,13 @@ def extract_postal_code(address_clean: str):
 
 
 def char_ngrams(s: str, n: int = NGRAM_N):
+    if not isinstance(s, str) or not s:
+        return set()
     s = s.replace(' ', '')
     if len(s) < n:
         return {s} if s else set()
     return {s[i:i + n] for i in range(len(s) - n + 1)}
+
 
 
 def _tokens(s: str):
@@ -68,63 +71,78 @@ class _CountryBlock:
     """Per-country inverted indices built once over the S2+S3 pool."""
 
     def __init__(self, records):
-        # records: list of dicts with entity_id, name_clean, addr_clean
-        self.records = records
-        self.exact_name = defaultdict(list)      # name_clean -> [entity_id]
-        self.token_index = defaultdict(list)      # rare token -> [entity_id]
-        self.ngram_index = defaultdict(list)       # char n-gram -> [entity_id]
-        self.postal_index = defaultdict(list)      # postal code -> [entity_id]
-        self.token_df = Counter()
-
+        self.exact_name = defaultdict(list)       # name_clean -> [entity_id]
+        self.first_tok_index = defaultdict(list)  # first word -> [entity_id]
+        self.rare_tok_index = defaultdict(list)   # rare token -> [entity_id]
+        self.postal_index = defaultdict(list)     # postal code -> [entity_id]
+        
+        token_df = Counter()
         for rec in records:
-            for tok in set(_tokens(rec['name_clean'])):
-                self.token_df[tok] += 1
+            name = rec['name_clean']
+            for tok in set(_tokens(name)):
+                if len(tok) >= 3:
+                    token_df[tok] += 1
 
         for rec in records:
             eid = rec['entity_id']
             name = rec['name_clean']
             self.exact_name[name].append(eid)
 
-            for tok in set(_tokens(name)):
-                if self.token_df[tok] <= RARE_TOKEN_DF_THRESHOLD:
-                    self.token_index[tok].append(eid)
+            words = _tokens(name)
+            if words:
+                first = words[0]
+                if 2 <= token_df[first] <= 50:
+                    self.first_tok_index[first].append(eid)
 
-            for ng in char_ngrams(name):
-                self.ngram_index[ng].append(eid)
+            for tok in set(words):
+                if 2 <= token_df[tok] <= RARE_TOKEN_DF_THRESHOLD:
+                    self.rare_tok_index[tok].append(eid)
 
             postal = extract_postal_code(rec.get('addr_clean', ''))
             if postal:
                 self.postal_index[postal].append(eid)
 
+        # Precompute sets for dense postal codes (> 50 entities) for instant O(1) membership check
+        self.postal_dense_sets = {p: set(eids) for p, eids in self.postal_index.items() if len(eids) > 50}
+
     def query(self, name_clean: str, addr_clean: str, top_k: int) -> dict:
         """Returns {entity_id: score} for one S1 record within this country."""
         scores = Counter()
 
-        # 1. Exact name match — strong signal, fixed bonus
+        # 1. Exact name match — strongest signal
         for eid in self.exact_name.get(name_clean, []):
             scores[eid] += 100
 
-        # 2. Rare token overlap
-        for tok in set(_tokens(name_clean)):
-            if self.token_df.get(tok, 0) <= RARE_TOKEN_DF_THRESHOLD:
-                for eid in self.token_index.get(tok, []):
-                    scores[eid] += 10
+        words = _tokens(name_clean)
+        # 2. First token match — high prefix correlation
+        if words:
+            for eid in self.first_tok_index.get(words[0], []):
+                scores[eid] += 20
 
-        # 3. Character n-gram overlap (accumulate shared n-gram counts)
-        for ng in char_ngrams(name_clean):
-            for eid in self.ngram_index.get(ng, []):
-                scores[eid] += 1
+        # 3. Rare token overlap
+        for tok in set(words):
+            for eid in self.rare_tok_index.get(tok, []):
+                scores[eid] += 10
 
-        # 4. Postal code match — strong signal
+        # 4. Postal code match — boost candidates with address locality
         postal = extract_postal_code(addr_clean)
         if postal:
-            for eid in self.postal_index.get(postal, []):
-                scores[eid] += 50
+            cand_list = self.postal_index.get(postal, [])
+            if len(cand_list) <= 50:
+                for eid in cand_list:
+                    scores[eid] += 50
+            elif postal in self.postal_dense_sets:
+                dense_set = self.postal_dense_sets[postal]
+                for eid in list(scores.keys()):
+                    if eid in dense_set:
+                        scores[eid] += 50
 
         if not scores:
             return {}
 
         return dict(scores.most_common(top_k))
+
+
 
 
 def _build_pool(df: pd.DataFrame):
